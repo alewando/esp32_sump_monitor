@@ -2,6 +2,7 @@
 #include "DHTesp.h"
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <BlinkCode.h>
 
 // WIFI Info
 const char* ssid = "Lewandowski";
@@ -36,7 +37,21 @@ float periodMaxHumidity = 0.00;
 int   periodMaxDistanceMm = 0;
 int   periodMaxVibrations[VIBRATION_PIN_COUNT];
 
+// Blink counts for error codes
+const int LED_BUILTIN_PIN = 2;
+const int ERR_BLINK_OK             = 1;
+const int ERR_BLINK_NO_WIFI        = 2;
+const int ERR_BLINK_NO_TEMP        = 3;
+const int ERR_BLINK_NO_DISTANCE    = 5;
+const int ERR_BLINK_HTTP_ERROR     = 6;
+using namespace blinkcode;
+BlinkCode blinkCode(LED_BUILTIN_PIN);
+
+
 void setup() {
+  pinMode(LED_BUILTIN_PIN, OUTPUT); // initialize GPIO pin 2 LED_BUILTIN as an output.
+  blinkCode.begin();
+
   Serial.begin(115200);
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
@@ -72,6 +87,7 @@ int loopIteration = 1;
 void loop() {
   iteration(loopIteration);
   loopIteration += 1;
+  BlinkCode::service(); // Asynchronous service routine for LED blink codes, should be called periodically
 
   // Every 3000 iterations (roughly 30 seconds?), record stats in influx
   if (loopIteration > 3000) {
@@ -95,9 +111,19 @@ void loop() {
         msg += ",";
       }
     }
-    httpPost();
+    int httpRespCode = httpPost();
 
+    // Blink LED once if all values were read and HTTP post succeeded
+    if(httpRespCode == 200 && periodMaxTemperatureC != 0.00 && periodMaxHumidity != 0.00 && periodMaxDistanceMm != 0) {
+      blinkCode.trigger(ERR_BLINK_OK);
+    } else {
+      // Blink to indicate an HTTP failure
+      if(httpRespCode != 200) {
+        blinkCode.trigger(ERR_BLINK_HTTP_ERROR);
+      }
+    }
     Serial.println(msg);
+    Serial.println("--------------------------------------------");
     resetPeriodValues();
   }
 }
@@ -136,6 +162,10 @@ dhtFlag: TempAndHumidity newValues = dht.getTempAndHumidity(); //Get the Tempera
       dhtRetryCount = dhtRetryCount + 1;
       Serial.println("DHT not ready to be read: status=" + String(dhtStatus) + ", retry count: " + String(dhtRetryCount));
       delay(300);
+      if(dhtRetryCount == DHT_MAX_RETRIES) {
+        Serial.println("Unable to read DHT value");
+        blinkCode.trigger(ERR_BLINK_NO_TEMP);
+      }
       goto dhtFlag;
     }
     float temperature = 0.00;
@@ -164,6 +194,10 @@ dhtFlag: TempAndHumidity newValues = dht.getTempAndHumidity(); //Get the Tempera
     // Read the distance sensor value
     int distanceMm = ultrasonic.distanceInMillimeters();
     Serial.printf("Current Distance: %dmm\n", distanceMm);
+    if(distanceMm == 0) {
+      Serial.println("Unable to read distance value");
+      blinkCode.trigger(ERR_BLINK_NO_DISTANCE);
+    }
     if (distanceMm > periodMaxDistanceMm) {
       periodMaxDistanceMm = distanceMm;
     }
@@ -173,7 +207,7 @@ dhtFlag: TempAndHumidity newValues = dht.getTempAndHumidity(); //Get the Tempera
   delay(10);
 }
 
-void httpPost() {
+int httpPost() {
   if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
 
@@ -193,15 +227,14 @@ void httpPost() {
     Serial.println("Sending HTTP POST to " + String(reportUrl));
     int httpResponseCode = http.POST(httpRequestData);
 
-    Serial.print("HTTP Response code: ");
-    Serial.println(httpResponseCode);
+    Serial.println("HTTP Response code: "+httpResponseCode);
 
     // Free resources
     http.end();
+    return httpResponseCode;
   }
-  else {
-    Serial.println("Cannot post to influx, WiFi Disconnected");
-  }
+  Serial.println("Cannot post to influx, WiFi Disconnected");
+  return -1;
 }
 
 void wifiConnect() {
@@ -226,6 +259,7 @@ void wifiConnect() {
   }
   Serial.print("Wifi connected, IP address: ");
   Serial.println(WiFi.localIP());
+  blinkCode.trigger(ERR_BLINK_OK);
 }
 
 const char* wl_status() {
@@ -240,4 +274,6 @@ const char* wl_status() {
     case WL_CONNECTION_LOST: return "WL_CONNECTION_LOST";
     case WL_DISCONNECTED: return "WL_DISCONNECTED";
   }
+  // Unknown status
+  return "WL_UNKNOWN_STATUS";
 }
